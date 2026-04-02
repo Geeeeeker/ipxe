@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       protocol:
-        description: '启动协议 (HTTP 或 HTTPS)'
+        description: '启动协议 (http 或 https)'
         required: true
         default: 'http'
         type: choice
@@ -14,17 +14,13 @@ on:
       architectures:
         description: '目标架构 (空格分隔) 可选: x86_64, i386, arm64, arm32'
         required: true
-        default: 'x86_64 arm64'
+        default: 'x86_64'
       extra_targets:
         description: '额外编译目标 (空格分隔，例如: ipxe.iso ipxe.usb 10ec8139.rom)'
         required: false
         default: ''
-      output_prefix:
-        description: '输出zip文件前缀 (例如: ubuntu -> ipxe-ubuntu-x86_64.zip)'
-        required: true
-        default: 'custom'
       cert_url:
-        description: 'HTTPS证书URL (仅当协议为HTTPS时必填)'
+        description: 'HTTPS证书URL (仅当协议为https时必填)'
         required: false
         default: 'http://txddns.dynv6.net:8081/cer.crt'
       base_url_http:
@@ -44,14 +40,32 @@ env:
   MAKEFLAGS: "-j4"
 
 jobs:
+  # 预处理：将空格分隔的架构字符串转为 JSON 数组
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          # 将输入的空格分隔字符串转成 JSON 数组，例如 "x86_64 arm64" -> ["x86_64","arm64"]
+          archs="${{ github.event.inputs.architectures }}"
+          if [ -z "$archs" ]; then
+            echo "matrix=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # 使用 jq 构建数组（容器自带 jq）
+          json_array=$(echo "$archs" | tr ' ' '\n' | jq -R . | jq -s .)
+          echo "matrix=$json_array" >> $GITHUB_OUTPUT
+
   build:
     name: Build ${{ matrix.arch }} (${{ github.event.inputs.protocol }})
+    needs: prepare
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        arch: ${{ fromJson(format('[{0}]', replace(github.event.inputs.architectures, ' ', '","'))) }}
-        # 架构到容器镜像和输出目录的映射
+        arch: ${{ fromJson(needs.prepare.outputs.matrix) }}
         include:
           - arch: x86_64
             container: ghcr.io/ipxe/ipxe-builder-x86_64
@@ -92,7 +106,6 @@ jobs:
         if: github.event.inputs.protocol == 'https'
         working-directory: ipxe/src
         run: |
-          # 在dhcp之后插入imgtrust命令
           sed -i '/^dhcp$/a imgtrust ${{ github.event.inputs.cert_url }}' boot.ipxe
           sed -i 's|${base_url}|${{ github.event.inputs.base_url_https }}|g' boot.ipxe
 
@@ -118,7 +131,6 @@ jobs:
       - name: Build UEFI binaries
         working-directory: ipxe/src
         run: |
-          # UEFI目标路径格式为 bin-{arch}-efi/
           EFI_DIR="bin-${{ matrix.arch }}-efi"
           for target in ${{ matrix.efi_targets }} ${{ github.event.inputs.extra_targets }}; do
             make ${EFI_DIR}/$target EMBED=boot.ipxe || true
@@ -126,26 +138,26 @@ jobs:
 
       - name: Collect artifacts
         run: |
-          mkdir -p artifacts/${{ matrix.arch }}
+          mkdir -p artifacts
           cd ipxe/src
           # 复制 BIOS 文件
           if [ -d bin ]; then
-            cp bin/undionly.kpxe bin/*.rom bin/*.pxe bin/*.lkrn bin/*.dsk bin/*.iso bin/*.usb ../artifacts/${{ matrix.arch }}/ 2>/dev/null || true
+            cp bin/undionly.kpxe bin/*.rom bin/*.pxe bin/*.lkrn bin/*.dsk bin/*.iso bin/*.usb ../artifacts/ 2>/dev/null || true
           fi
           # 复制 UEFI 文件
           EFI_DIR="bin-${{ matrix.arch }}-efi"
           if [ -d ${EFI_DIR} ]; then
-            cp ${EFI_DIR}/*.efi ${EFI_DIR}/*.iso ${EFI_DIR}/*.usb ../artifacts/${{ matrix.arch }}/ 2>/dev/null || true
+            cp ${EFI_DIR}/*.efi ${EFI_DIR}/*.iso ${EFI_DIR}/*.usb ../artifacts/ 2>/dev/null || true
           fi
 
-      - name: Package artifacts
+      - name: Package artifacts (ipxe-${{ github.event.inputs.protocol }}-${{ matrix.arch }}.zip)
         run: |
           cd artifacts
-          zip -r ../ipxe-${{ github.event.inputs.output_prefix }}-${{ matrix.arch }}.zip ${{ matrix.arch }}/
+          zip -r ../ipxe-${{ github.event.inputs.protocol }}-${{ matrix.arch }}.zip .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ipxe-${{ github.event.inputs.output_prefix }}-${{ matrix.arch }}
-          path: ipxe-${{ github.event.inputs.output_prefix }}-${{ matrix.arch }}.zip
+          name: ipxe-${{ github.event.inputs.protocol }}-${{ matrix.arch }}
+          path: ipxe-${{ github.event.inputs.protocol }}-${{ matrix.arch }}.zip
           if-no-files-found: error
