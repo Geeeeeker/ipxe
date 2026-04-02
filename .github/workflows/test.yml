@@ -16,23 +16,23 @@ on:
         required: true
         default: 'x86_64'
       extra_targets:
-        description: '额外编译目标 (空格分隔)'
+        description: '额外编译目标 (空格分隔，例如: ipxe.iso ipxe.usb 10ec8139.rom)'
         required: false
         default: ''
       cert_url:
-        description: 'HTTPS证书URL'
+        description: 'HTTPS证书URL (仅当协议为https时必填)'
         required: false
         default: 'http://txddns.dynv6.net/ipxe/cer.crt'
       base_url_http:
-        description: 'HTTP基础URL'
+        description: 'HTTP基础URL (不含路径)'
         required: false
         default: 'http://txddns.dynv6.net'
       base_url_https:
-        description: 'HTTPS基础URL'
+        description: 'HTTPS基础URL (不含路径)'
         required: false
         default: 'https://txddns.dynv6.net'
       base_path:
-        description: '基础路径 (如 /ipxe)'
+        description: '基础路径 (menu.ipxe所在目录，如 /ipxe)'
         required: false
         default: '/ipxe'
       menu_filename:
@@ -51,16 +51,16 @@ jobs:
     steps:
       - id: set-matrix
         run: |
-          # 读取输入，去除多余空格，按空格分割，过滤空字符串
           archs="${{ github.event.inputs.architectures }}"
-          # 使用 xargs 去除首尾空格，然后按空格分割
-          cleaned=$(echo "$archs" | xargs)
-          # 构建 JSON 数组
+          echo "Raw input: '$archs'"
+          archs=$(echo "$archs" | xargs)
+          if [ -z "$archs" ]; then
+            echo "matrix=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
           json_array="["
           first=true
-          for arch in $cleaned; do
-            # 跳过空字符串
-            if [ -z "$arch" ]; then continue; fi
+          for arch in $archs; do
             if [ "$first" = true ]; then
               first=false
             else
@@ -70,7 +70,7 @@ jobs:
           done
           json_array="$json_array]"
           echo "matrix=$json_array" >> $GITHUB_OUTPUT
-          echo "Final matrix: $json_array"
+          echo "Generated matrix: $json_array"
 
   build:
     name: Build ${{ matrix.arch }} (${{ github.event.inputs.protocol }})
@@ -100,6 +100,7 @@ jobs:
     container:
       image: ${{ matrix.container }}
     steps:
+      # 不需要安装 zip，tar 已内置
       - name: Checkout iPXE source
         uses: actions/checkout@v4
         with:
@@ -167,10 +168,11 @@ jobs:
             *)      echo "display=${{ matrix.arch }}" >> $GITHUB_OUTPUT ;;
           esac
 
-      - name: Package artifacts (tar.gz)
+      # 改用 tar 打包，生成 .tar.gz 文件
+      - name: Package artifacts
         run: |
           cd artifacts
-          tar -czf ../ipxe-${{ github.event.inputs.protocol }}-${{ steps.map_name.outputs.display }}.tar.gz .
+          tar czf ../ipxe-${{ github.event.inputs.protocol }}-${{ steps.map_name.outputs.display }}.tar.gz .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
