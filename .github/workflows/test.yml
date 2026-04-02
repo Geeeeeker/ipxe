@@ -16,23 +16,23 @@ on:
         required: true
         default: 'x86_64'
       extra_targets:
-        description: '额外编译目标 (空格分隔，例如: ipxe.iso ipxe.usb 10ec8139.rom)'
+        description: '额外编译目标 (空格分隔)'
         required: false
         default: ''
       cert_url:
-        description: 'HTTPS证书URL (仅当协议为https时必填)'
+        description: 'HTTPS证书URL'
         required: false
         default: 'http://txddns.dynv6.net/ipxe/cer.crt'
       base_url_http:
-        description: 'HTTP基础URL (不含路径)'
+        description: 'HTTP基础URL'
         required: false
         default: 'http://txddns.dynv6.net'
       base_url_https:
-        description: 'HTTPS基础URL (不含路径)'
+        description: 'HTTPS基础URL'
         required: false
         default: 'https://txddns.dynv6.net'
       base_path:
-        description: '基础路径 (menu.ipxe所在目录，如 /ipxe)'
+        description: '基础路径 (如 /ipxe)'
         required: false
         default: '/ipxe'
       menu_filename:
@@ -51,11 +51,26 @@ jobs:
     steps:
       - id: set-matrix
         run: |
+          # 读取输入，去除多余空格，按空格分割，过滤空字符串
           archs="${{ github.event.inputs.architectures }}"
-          # 使用 jq 生成可靠的 JSON 数组
-          json_array=$(echo "$archs" | tr ' ' '\n' | jq -R . | jq -s -c .)
+          # 使用 xargs 去除首尾空格，然后按空格分割
+          cleaned=$(echo "$archs" | xargs)
+          # 构建 JSON 数组
+          json_array="["
+          first=true
+          for arch in $cleaned; do
+            # 跳过空字符串
+            if [ -z "$arch" ]; then continue; fi
+            if [ "$first" = true ]; then
+              first=false
+            else
+              json_array="$json_array,"
+            fi
+            json_array="$json_array\"$arch\""
+          done
+          json_array="$json_array]"
           echo "matrix=$json_array" >> $GITHUB_OUTPUT
-          echo "Generated matrix: $json_array"
+          echo "Final matrix: $json_array"
 
   build:
     name: Build ${{ matrix.arch }} (${{ github.event.inputs.protocol }})
@@ -65,7 +80,6 @@ jobs:
       fail-fast: false
       matrix:
         arch: ${{ fromJson(needs.prepare.outputs.matrix) }}
-        # 注意：include 只提供映射信息，不会增加额外的架构
         include:
           - arch: x86_64
             container: ghcr.io/ipxe/ipxe-builder-x86_64
