@@ -44,21 +44,22 @@ env:
   MAKEFLAGS: "-j4"
 
 jobs:
-  # 预处理：将空格分隔的架构字符串转为 JSON 数组，并生成友好名称映射
   prepare:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
-      name_map: ${{ steps.set-name-map.outputs.name_map }}
     steps:
       - id: set-matrix
         run: |
           archs="${{ github.event.inputs.architectures }}"
+          echo "Raw input: '$archs'"
+          # 去除多余空格，按空格分割
+          archs=$(echo "$archs" | xargs)  # 去除首尾空格
           if [ -z "$archs" ]; then
             echo "matrix=[]" >> $GITHUB_OUTPUT
             exit 0
           fi
-          # 手动构建 JSON 数组，避免 jq 的换行问题
+          # 构建 JSON 数组
           json_array="["
           first=true
           for arch in $archs; do
@@ -71,13 +72,7 @@ jobs:
           done
           json_array="$json_array]"
           echo "matrix=$json_array" >> $GITHUB_OUTPUT
-      - id: set-name-map
-        run: |
-          # 定义架构名称映射：内部编译名 -> 输出文件名中的显示名
-          echo "map_x86_64=amd64" >> $GITHUB_OUTPUT
-          echo "map_i386=i386" >> $GITHUB_OUTPUT
-          echo "map_arm64=arm64" >> $GITHUB_OUTPUT
-          echo "map_arm32=arm32" >> $GITHUB_OUTPUT
+          echo "Generated matrix: $json_array"
 
   build:
     name: Build ${{ matrix.arch }} (${{ github.event.inputs.protocol }})
@@ -98,7 +93,7 @@ jobs:
             efi_targets: ipxe.efi
           - arch: arm64
             container: ghcr.io/ipxe/ipxe-builder-arm64
-            bios_targets: ''   # ARM64 没有 BIOS PXE
+            bios_targets: ''
             efi_targets: ipxe.efi
           - arch: arm32
             container: ghcr.io/ipxe/ipxe-builder-arm32
@@ -107,6 +102,9 @@ jobs:
     container:
       image: ${{ matrix.container }}
     steps:
+      - name: Install zip
+        run: apk add --no-cache zip
+
       - name: Checkout iPXE source
         uses: actions/checkout@v4
         with:
@@ -116,7 +114,6 @@ jobs:
       - name: Generate embedded script
         working-directory: ipxe/src
         run: |
-          # 构建完整的 menu.ipxe URL
           if [ "${{ github.event.inputs.protocol }}" = "https" ]; then
             BASE_URL="${{ github.event.inputs.base_url_https }}${{ github.event.inputs.base_path }}"
           else
@@ -136,7 +133,7 @@ jobs:
         run: |
           sed -i '/^dhcp$/a imgtrust ${{ github.event.inputs.cert_url }}' boot.ipxe
 
-      - name: Build BIOS binaries (if any)
+      - name: Build BIOS binaries
         if: matrix.bios_targets != ''
         working-directory: ipxe/src
         run: |
@@ -156,17 +153,15 @@ jobs:
         run: |
           mkdir -p artifacts
           cd ipxe/src
-          # 复制 BIOS 文件
           if [ -d bin ]; then
             cp bin/undionly.kpxe bin/*.rom bin/*.pxe bin/*.lkrn bin/*.dsk bin/*.iso bin/*.usb ../artifacts/ 2>/dev/null || true
           fi
-          # 复制 UEFI 文件
           EFI_DIR="bin-${{ matrix.arch }}-efi"
           if [ -d ${EFI_DIR} ]; then
             cp ${EFI_DIR}/*.efi ${EFI_DIR}/*.iso ${EFI_DIR}/*.usb ../artifacts/ 2>/dev/null || true
           fi
 
-      - name: Map arch name for output
+      - name: Map arch name for output (x86_64 -> amd64)
         id: map_name
         run: |
           case "${{ matrix.arch }}" in
@@ -177,7 +172,7 @@ jobs:
             *)      echo "display=${{ matrix.arch }}" >> $GITHUB_OUTPUT ;;
           esac
 
-      - name: Package artifacts (ipxe-${{ github.event.inputs.protocol }}-${{ steps.map_name.outputs.display }}.zip)
+      - name: Package artifacts
         run: |
           cd artifacts
           zip -r ../ipxe-${{ github.event.inputs.protocol }}-${{ steps.map_name.outputs.display }}.zip .
