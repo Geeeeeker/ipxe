@@ -1,0 +1,89 @@
+name: Build Custom iPXE (HTTP/HTTPS)
+
+# 定义工作流的手动触发方式
+on:
+  workflow_dispatch:
+    inputs:
+      protocol:
+        description: '启动协议'
+        required: true
+        default: 'http'
+        type: choice
+        options:
+          - http
+          - https
+      release_tag:
+        description: 'GitHub Release 标签 (例如: v1.0.0)'
+        required: true
+        default: 'latest'
+
+# 定义工作流的所有任务
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 检出 iPXE 官方源代码
+      - name: Checkout iPXE source code
+        uses: actions/checkout@v4
+        with:
+          repository: ipxe/ipxe
+          path: ipxe
+
+      # 2. 创建并配置嵌入式脚本
+      - name: Prepare embedded script
+        run: |
+          cat > ipxe/src/boot.ipxe << 'EOF'
+          #!ipxe
+          dhcp
+          goto \${protocol}
+          
+          :http
+          echo "Booting via HTTP..."
+          set base-url http://txddns.dynv6.net:8081
+          chain \${base-url}/menu.ipxe
+          exit
+          
+          :https
+          echo "Booting via HTTPS..."
+          imgtrust http://txddns.dynv6.net:8081/cer.crt
+          set base-url https://txddns.dynv6.net:8081
+          chain \${base-url}/menu.ipxe
+          exit
+          EOF
+
+      # 3. 安装编译依赖
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make gcc binutils mtools liblzma-dev
+
+      # 4. 构建 iPXE 二进制文件
+      - name: Build iPXE binaries
+        run: |
+          cd ipxe/src
+          
+          # 构建 BIOS 版本 (undionly.kpxe)
+          make bin/undionly.kpxe EMBED=boot.ipxe
+          
+          # 构建 UEFI 版本 (ipxe.efi)
+          make bin-x86_64-efi/ipxe.efi EMBED=boot.ipxe
+
+      # 5. 将编译好的文件打包成压缩包
+      - name: Package artifacts
+        run: |
+          mkdir -p ipxe-custom
+          cp ipxe/src/bin/undionly.kpxe ipxe-custom/
+          cp ipxe/src/bin-x86_64-efi/ipxe.efi ipxe-custom/
+          cd ipxe-custom
+          zip -r ../ipxe-${{ github.event.inputs.protocol }}.zip .
+
+      # 6. 上传编译产物到 GitHub Release
+      - name: Upload to GitHub Release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: ipxe-${{ github.event.inputs.protocol }}.zip
+          asset_name: ipxe-${{ github.event.inputs.protocol }}-${{ github.event.inputs.release_tag }}.zip
+          tag: ${{ github.event.inputs.release_tag }}
+          overwrite: true
+          body: "iPXE 编译版本，协议：${{ github.event.inputs.protocol }}"
