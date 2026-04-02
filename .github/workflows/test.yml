@@ -22,41 +22,62 @@ on:
       cert_url:
         description: 'HTTPS证书URL (仅当协议为https时必填)'
         required: false
-        default: 'http://txddns.dynv6.net:8081/cer.crt'
+        default: 'http://txddns.dynv6.net/ipxe/cer.crt'
       base_url_http:
-        description: 'HTTP基础URL (不含/menu.ipxe)'
+        description: 'HTTP基础URL (不含路径)'
         required: false
-        default: 'http://txddns.dynv6.net:8081'
+        default: 'http://txddns.dynv6.net'
       base_url_https:
-        description: 'HTTPS基础URL (不含/menu.ipxe)'
+        description: 'HTTPS基础URL (不含路径)'
         required: false
         default: 'https://txddns.dynv6.net'
-      menu_path:
-        description: 'menu.ipxe路径 (相对于基础URL)'
+      base_path:
+        description: '基础路径 (menu.ipxe所在目录，如 /ipxe)'
         required: false
-        default: '/menu.ipxe'
+        default: '/ipxe'
+      menu_filename:
+        description: 'menu.ipxe文件名'
+        required: false
+        default: 'menu.ipxe'
 
 env:
   MAKEFLAGS: "-j4"
 
 jobs:
-  # 预处理：将空格分隔的架构字符串转为 JSON 数组
+  # 预处理：将空格分隔的架构字符串转为 JSON 数组，并生成友好名称映射
   prepare:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
+      name_map: ${{ steps.set-name-map.outputs.name_map }}
     steps:
       - id: set-matrix
         run: |
-          # 将输入的空格分隔字符串转成 JSON 数组，例如 "x86_64 arm64" -> ["x86_64","arm64"]
           archs="${{ github.event.inputs.architectures }}"
           if [ -z "$archs" ]; then
             echo "matrix=[]" >> $GITHUB_OUTPUT
             exit 0
           fi
-          # 使用 jq 构建数组（容器自带 jq）
-          json_array=$(echo "$archs" | tr ' ' '\n' | jq -R . | jq -s .)
+          # 手动构建 JSON 数组，避免 jq 的换行问题
+          json_array="["
+          first=true
+          for arch in $archs; do
+            if [ "$first" = true ]; then
+              first=false
+            else
+              json_array="$json_array,"
+            fi
+            json_array="$json_array\"$arch\""
+          done
+          json_array="$json_array]"
           echo "matrix=$json_array" >> $GITHUB_OUTPUT
+      - id: set-name-map
+        run: |
+          # 定义架构名称映射：内部编译名 -> 输出文件名中的显示名
+          echo "map_x86_64=amd64" >> $GITHUB_OUTPUT
+          echo "map_i386=i386" >> $GITHUB_OUTPUT
+          echo "map_arm64=arm64" >> $GITHUB_OUTPUT
+          echo "map_arm32=arm32" >> $GITHUB_OUTPUT
 
   build:
     name: Build ${{ matrix.arch }} (${{ github.event.inputs.protocol }})
@@ -95,30 +116,25 @@ jobs:
       - name: Generate embedded script
         working-directory: ipxe/src
         run: |
-          cat > boot.ipxe << 'EOF'
+          # 构建完整的 menu.ipxe URL
+          if [ "${{ github.event.inputs.protocol }}" = "https" ]; then
+            BASE_URL="${{ github.event.inputs.base_url_https }}${{ github.event.inputs.base_path }}"
+          else
+            BASE_URL="${{ github.event.inputs.base_url_http }}${{ github.event.inputs.base_path }}"
+          fi
+          MENU_URL="${BASE_URL}/${{ github.event.inputs.menu_filename }}"
+          cat > boot.ipxe << EOF
           #!ipxe
           dhcp
-          set base-url ${base_url}
-          chain \${base-url}${menu_path} || shell
+          set menu-url ${MENU_URL}
+          chain \${menu-url} || shell
           EOF
 
-      - name: Customize script for HTTPS
+      - name: Add imgtrust for HTTPS
         if: github.event.inputs.protocol == 'https'
         working-directory: ipxe/src
         run: |
           sed -i '/^dhcp$/a imgtrust ${{ github.event.inputs.cert_url }}' boot.ipxe
-          sed -i 's|${base_url}|${{ github.event.inputs.base_url_https }}|g' boot.ipxe
-
-      - name: Customize script for HTTP
-        if: github.event.inputs.protocol == 'http'
-        working-directory: ipxe/src
-        run: |
-          sed -i 's|${base_url}|${{ github.event.inputs.base_url_http }}|g' boot.ipxe
-
-      - name: Replace menu_path placeholder
-        working-directory: ipxe/src
-        run: |
-          sed -i "s|\${menu_path}|${{ github.event.inputs.menu_path }}|g" boot.ipxe
 
       - name: Build BIOS binaries (if any)
         if: matrix.bios_targets != ''
@@ -150,14 +166,25 @@ jobs:
             cp ${EFI_DIR}/*.efi ${EFI_DIR}/*.iso ${EFI_DIR}/*.usb ../artifacts/ 2>/dev/null || true
           fi
 
-      - name: Package artifacts (ipxe-${{ github.event.inputs.protocol }}-${{ matrix.arch }}.zip)
+      - name: Map arch name for output
+        id: map_name
+        run: |
+          case "${{ matrix.arch }}" in
+            x86_64) echo "display=amd64" >> $GITHUB_OUTPUT ;;
+            i386)   echo "display=i386" >> $GITHUB_OUTPUT ;;
+            arm64)  echo "display=arm64" >> $GITHUB_OUTPUT ;;
+            arm32)  echo "display=arm32" >> $GITHUB_OUTPUT ;;
+            *)      echo "display=${{ matrix.arch }}" >> $GITHUB_OUTPUT ;;
+          esac
+
+      - name: Package artifacts (ipxe-${{ github.event.inputs.protocol }}-${{ steps.map_name.outputs.display }}.zip)
         run: |
           cd artifacts
-          zip -r ../ipxe-${{ github.event.inputs.protocol }}-${{ matrix.arch }}.zip .
+          zip -r ../ipxe-${{ github.event.inputs.protocol }}-${{ steps.map_name.outputs.display }}.zip .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ipxe-${{ github.event.inputs.protocol }}-${{ matrix.arch }}
-          path: ipxe-${{ github.event.inputs.protocol }}-${{ matrix.arch }}.zip
+          name: ipxe-${{ github.event.inputs.protocol }}-${{ steps.map_name.outputs.display }}
+          path: ipxe-${{ github.event.inputs.protocol }}-${{ steps.map_name.outputs.display }}.zip
           if-no-files-found: error
