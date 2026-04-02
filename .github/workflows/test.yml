@@ -1,0 +1,151 @@
+name: Build Custom iPXE (Multi-Arch, HTTP/HTTPS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      protocol:
+        description: '启动协议 (HTTP 或 HTTPS)'
+        required: true
+        default: 'http'
+        type: choice
+        options:
+          - http
+          - https
+      architectures:
+        description: '目标架构 (空格分隔) 可选: x86_64, i386, arm64, arm32'
+        required: true
+        default: 'x86_64 arm64'
+      extra_targets:
+        description: '额外编译目标 (空格分隔，例如: ipxe.iso ipxe.usb 10ec8139.rom)'
+        required: false
+        default: ''
+      output_prefix:
+        description: '输出zip文件前缀 (例如: ubuntu -> ipxe-ubuntu-x86_64.zip)'
+        required: true
+        default: 'custom'
+      cert_url:
+        description: 'HTTPS证书URL (仅当协议为HTTPS时必填)'
+        required: false
+        default: 'http://txddns.dynv6.net:8081/cer.crt'
+      base_url_http:
+        description: 'HTTP基础URL (不含/menu.ipxe)'
+        required: false
+        default: 'http://txddns.dynv6.net:8081'
+      base_url_https:
+        description: 'HTTPS基础URL (不含/menu.ipxe)'
+        required: false
+        default: 'https://txddns.dynv6.net'
+      menu_path:
+        description: 'menu.ipxe路径 (相对于基础URL)'
+        required: false
+        default: '/menu.ipxe'
+
+env:
+  MAKEFLAGS: "-j4"
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }} (${{ github.event.inputs.protocol }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJson(format('[{0}]', replace(github.event.inputs.architectures, ' ', '","'))) }}
+        # 架构到容器镜像和输出目录的映射
+        include:
+          - arch: x86_64
+            container: ghcr.io/ipxe/ipxe-builder-x86_64
+            bios_targets: undionly.kpxe
+            efi_targets: ipxe.efi
+          - arch: i386
+            container: ghcr.io/ipxe/ipxe-builder-i386
+            bios_targets: undionly.kpxe
+            efi_targets: ipxe.efi
+          - arch: arm64
+            container: ghcr.io/ipxe/ipxe-builder-arm64
+            bios_targets: ''   # ARM64 没有 BIOS PXE
+            efi_targets: ipxe.efi
+          - arch: arm32
+            container: ghcr.io/ipxe/ipxe-builder-arm32
+            bios_targets: ''
+            efi_targets: ipxe.efi
+    container:
+      image: ${{ matrix.container }}
+    steps:
+      - name: Checkout iPXE source
+        uses: actions/checkout@v4
+        with:
+          repository: ipxe/ipxe
+          path: ipxe
+
+      - name: Generate embedded script
+        working-directory: ipxe/src
+        run: |
+          cat > boot.ipxe << 'EOF'
+          #!ipxe
+          dhcp
+          set base-url ${base_url}
+          chain \${base-url}${menu_path} || shell
+          EOF
+
+      - name: Customize script for HTTPS
+        if: github.event.inputs.protocol == 'https'
+        working-directory: ipxe/src
+        run: |
+          # 在dhcp之后插入imgtrust命令
+          sed -i '/^dhcp$/a imgtrust ${{ github.event.inputs.cert_url }}' boot.ipxe
+          sed -i 's|${base_url}|${{ github.event.inputs.base_url_https }}|g' boot.ipxe
+
+      - name: Customize script for HTTP
+        if: github.event.inputs.protocol == 'http'
+        working-directory: ipxe/src
+        run: |
+          sed -i 's|${base_url}|${{ github.event.inputs.base_url_http }}|g' boot.ipxe
+
+      - name: Replace menu_path placeholder
+        working-directory: ipxe/src
+        run: |
+          sed -i "s|\${menu_path}|${{ github.event.inputs.menu_path }}|g" boot.ipxe
+
+      - name: Build BIOS binaries (if any)
+        if: matrix.bios_targets != ''
+        working-directory: ipxe/src
+        run: |
+          for target in ${{ matrix.bios_targets }} ${{ github.event.inputs.extra_targets }}; do
+            make bin/$target EMBED=boot.ipxe || true
+          done
+
+      - name: Build UEFI binaries
+        working-directory: ipxe/src
+        run: |
+          # UEFI目标路径格式为 bin-{arch}-efi/
+          EFI_DIR="bin-${{ matrix.arch }}-efi"
+          for target in ${{ matrix.efi_targets }} ${{ github.event.inputs.extra_targets }}; do
+            make ${EFI_DIR}/$target EMBED=boot.ipxe || true
+          done
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts/${{ matrix.arch }}
+          cd ipxe/src
+          # 复制 BIOS 文件
+          if [ -d bin ]; then
+            cp bin/undionly.kpxe bin/*.rom bin/*.pxe bin/*.lkrn bin/*.dsk bin/*.iso bin/*.usb ../artifacts/${{ matrix.arch }}/ 2>/dev/null || true
+          fi
+          # 复制 UEFI 文件
+          EFI_DIR="bin-${{ matrix.arch }}-efi"
+          if [ -d ${EFI_DIR} ]; then
+            cp ${EFI_DIR}/*.efi ${EFI_DIR}/*.iso ${EFI_DIR}/*.usb ../artifacts/${{ matrix.arch }}/ 2>/dev/null || true
+          fi
+
+      - name: Package artifacts
+        run: |
+          cd artifacts
+          zip -r ../ipxe-${{ github.event.inputs.output_prefix }}-${{ matrix.arch }}.zip ${{ matrix.arch }}/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipxe-${{ github.event.inputs.output_prefix }}-${{ matrix.arch }}
+          path: ipxe-${{ github.event.inputs.output_prefix }}-${{ matrix.arch }}.zip
+          if-no-files-found: error
